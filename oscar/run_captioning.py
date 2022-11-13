@@ -25,6 +25,9 @@ from oscar.modeling.modeling_bert import BertForImageCaptioning
 from transformers.pytorch_transformers import BertTokenizer, BertConfig
 from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
 
+from demo import oscar_dataset_builder
+import clip
+from PIL import Image
 
 class CaptionTSVDataset(Dataset):
     def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
@@ -673,6 +676,18 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
     def gen_rows():
         time_meter = 0
 
+        # Dictionary of image file names
+        prf = args.input_path.split('/')[-1]
+        id_dict = {}
+        with open(os.path.join(args.working_dir, prf + '.id_dictionary.txt')) as f:
+            for line in f:
+                (key, val) = line.split()
+                id_dict[int(key)] = val
+
+        # CLIP init
+        clip_model, clip_preprocess = clip.load("ViT-B/32")
+        clip_model.cuda().eval()
+
         with torch.no_grad():
             for step, (img_keys, batch) in tqdm(enumerate(test_dataloader)):
                 batch = tuple(t.to(args.device) for t in batch)
@@ -697,10 +712,26 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                 for img_key, caps, confs in zip(img_keys, all_caps, all_confs):
                     res = []
                     for cap, conf in zip(caps, confs):
-                        cap = tokenizer.decode(cap.tolist(), skip_special_tokens=True)
+                        cap = tokenizer.decode(cap.tolist(), skip_special_tokens=True)  # Decoded caption
                         res.append({'caption': cap, 'conf': conf.item()})
                     if isinstance(img_key, torch.Tensor):
                         img_key = img_key.item()
+                    for item in res:
+                        print('Caption: {} \tConfidence {}'.format(item['caption'], item['conf']))
+                        img_path = os.path.join(args.input_path, id_dict[int(img_key)])
+                        image = Image.open(img_path).convert("RGB")
+                        image_input = torch.tensor(np.stack([clip_preprocess(image)])).cuda()
+                        text_tokens = clip.tokenize([item['caption']]).cuda()
+
+                        # Compute cosine sim
+                        with torch.no_grad():
+                            image_features = clip_model.encode_image(image_input).float()
+                            text_features = clip_model.encode_text(text_tokens).float()
+
+                        image_features /= image_features.norm(dim=-1, keepdim=True)
+                        text_features /= text_features.norm(dim=-1, keepdim=True)
+                        similarity = text_features.cpu().numpy() @ image_features.cpu().numpy().T
+                        print('Caption: {} \tCLIP similarity: {}'.format(item['caption'], similarity[0, 0]))
                     yield img_key, json.dumps(res)
 
         logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
@@ -718,13 +749,160 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
         torch.distributed.barrier()
 
 
+def clip_tune(args, dataloader, model, tokenizer, output_file):
+    cls_token_id, sep_token_id, pad_token_id, mask_token_id, period_token_id = \
+        tokenizer.convert_tokens_to_ids([tokenizer.cls_token, tokenizer.sep_token,
+                                         tokenizer.pad_token, tokenizer.mask_token, '.'])
+    # world_size = get_world_size()
+    # if world_size == 1:
+    #     cache_file = predict_file
+    # else:
+    #     cache_file = op.splitext(predict_file)[0] + '_{}_{}'.format(get_rank(),
+    #                                                                 world_size) + op.splitext(predict_file)[1]
+
+    model.eval()
+    inputs_param = {'is_decode': True,
+                    'do_sample': False,
+                    'bos_token_id': cls_token_id,
+                    'pad_token_id': pad_token_id,
+                    'eos_token_ids': [sep_token_id],
+                    'mask_token_id': mask_token_id,
+                    # for adding od labels
+                    'add_od_labels': args.add_od_labels, 'od_labels_start_posid': args.max_seq_a_length,
+
+                    # hyperparameters of beam search
+                    'max_length': args.max_gen_length,
+                    'num_beams': args.num_beams,
+                    "temperature": args.temperature,
+                    "top_k": args.top_k,
+                    "top_p": args.top_p,
+                    "repetition_penalty": args.repetition_penalty,
+                    "length_penalty": args.length_penalty,
+                    "num_return_sequences": args.num_return_sequences,
+                    "num_keep_best": args.num_keep_best,
+                    }
+    if args.use_cbs:
+        inputs_param.update({'use_cbs': True,
+                             'min_constraints_to_satisfy': args.min_constraints_to_satisfy,
+                             })
+
+    if args.max_steps > 0:
+        t_total = args.max_steps
+        args.num_train_epochs = args.max_steps // (len(dataloader) // \
+                args.gradient_accumulation_steps) + 1
+    else:
+        t_total = len(dataloader) // args.gradient_accumulation_steps \
+                * args.num_train_epochs
+
+    # Prepare optimizer and scheduler
+    no_decay = ['bias', 'LayerNorm.weight']
+    grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not \
+            any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if \
+            any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    optimizer = AdamW(grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    # optimizer = AdamW(grouped_parameters, lr=0.003, eps=args.adam_epsilon)
+    if args.scheduler == "constant":
+        scheduler = WarmupConstantSchedule(
+                optimizer, warmup_steps=args.warmup_steps)
+    elif args.scheduler == "linear":
+        scheduler = WarmupLinearSchedule(
+                optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+    else:
+        raise ValueError("Unknown scheduler type: {}".format(args.scheduler))
+
+    global_step, global_loss, global_acc =0,  0.0, 0.0
+    model.zero_grad()
+    eval_log = []
+    best_score = 0
+
+    # Dictionary of image file names
+    prf = args.input_path.split('/')[-1]
+    id_dict = {}
+    with open(os.path.join(args.working_dir, prf + '.id_dictionary.txt')) as f:
+        for line in f:
+            (key, val) = line.split()
+            id_dict[int(key)] = val
+
+    # CLIP init
+    clip_model, clip_preprocess = clip.load("ViT-B/32")
+    clip_model.cuda().eval()
+
+    def get_clip_loss(inputs):
+        time_meter = 0
+        loss = 0
+        # with torch.no_grad():
+        tic = time.time()
+        # captions, logprobs
+        outputs = model(**inputs)
+        time_meter += time.time() - tic
+
+        all_caps = outputs[0]  # batch_size * num_keep_best * max_len
+        all_confs = torch.exp(outputs[1])
+
+        for img_key, caps, confs in zip(img_keys, all_caps, all_confs):
+            res = []
+            for cap, conf in zip(caps, confs):
+                cap = tokenizer.decode(cap.tolist(), skip_special_tokens=True)  # Decoded caption
+                res.append({'caption': cap, 'conf': conf.item()})
+            if isinstance(img_key, torch.Tensor):
+                img_key = img_key.item()
+            for item in res:
+                print('Caption: {} \tConfidence {}'.format(item['caption'], item['conf']))
+                img_path = os.path.join(args.input_path, id_dict[int(img_key)])
+                image = Image.open(img_path).convert("RGB")
+                image_input = torch.tensor(np.stack([clip_preprocess(image)])).cuda()
+                text_tokens = clip.tokenize([item['caption']]).cuda()
+
+                # Compute cosine sim
+                # with torch.no_grad():
+                image_features = clip_model.encode_image(image_input).float()
+                text_features = clip_model.encode_text(text_tokens).float()
+
+                # image_features /= image_features.norm(dim=-1, keepdim=True)
+                # text_features /= text_features.norm(dim=-1, keepdim=True)
+
+                # similarity = text_features.cpu().numpy() @ image_features.cpu().numpy().T
+                similarity = torch.cosine_similarity(text_features, image_features, dim=1)
+                print('Caption: {} \tCLIP similarity: {}'.format(item['caption'], similarity.item()))
+                loss -= similarity
+            return loss
+
+    # for epoch in range(int(args.num_train_epochs)):
+    for epoch in range(int(5)):
+        # with torch.no_grad():
+        for step, (img_keys, batch) in tqdm(enumerate(dataloader)):
+            batch = tuple(t.to(args.device) for t in batch)
+            inputs = {
+                'input_ids': batch[0], 'attention_mask': batch[1],
+                'token_type_ids': batch[2], 'img_feats': batch[3],
+                'masked_pos': batch[4],
+            }
+            if args.use_cbs:
+                inputs.update({
+                    'fsm': batch[5],
+                    'num_constraints': batch[6],
+                })
+            inputs.update(inputs_param)
+            loss = get_clip_loss(inputs)
+            print('Loss: {}'.format(loss))
+            loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            global_step += 1
+            scheduler.step()
+            optimizer.step()
+            model.zero_grad()
+
+
 def restore_training_settings(args):
     if args.do_train:
         if not args.scst:
             return args
         checkpoint = args.model_name_or_path
     else:
-        assert args.do_test or args.do_eval
+        assert args.do_test or args.do_eval or args.do_clip_tune
         checkpoint = args.eval_model_dir
     # restore training settings, check hasattr for backward compatibility
     train_args = torch.load(op.join(checkpoint, 'training_args.bin'))
@@ -921,6 +1099,59 @@ def main():
                         help='Use constrained beam search for decoding')
     parser.add_argument('--min_constraints_to_satisfy', type=int, default=2,
                         help="minimum number of constraints to satisfy")
+    # Args for detectron2
+    parser.add_argument(
+        "--config-file",
+        default="detectron2/configs/quick_schedules/mask_rcnn_R_50_FPN_inference_acc_test.yaml",
+        metavar="FILE",
+        help="path to config file",
+    )
+    parser.add_argument(
+        "--working-dir",
+        default='oscar/datasets',
+        help="A file or directory to save output visualizations. "
+        "If not given, will show output in an OpenCV window.",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.5,
+        help="Minimum score for instance predictions to be shown",
+    )
+    parser.add_argument(
+        "--min-detected",
+        default=10,
+        help="Minimum number of instances for image to generate files",
+    )
+    parser.add_argument(
+        "--opts",
+        help="Modify config options using the command-line 'KEY VALUE' pairs",
+        default=['MODEL.WEIGHTS', 'detectron2://COCO-Detection/faster_rcnn_R_50_C4_3x/137849393/model_final_f97cb7.pkl'],
+        nargs=argparse.REMAINDER,
+    )
+    parser.add_argument(
+        "--input-path",
+        default="datasets/coco_images",
+        help="path to file with input images",
+    )
+    parser.add_argument(
+        "--coco-classnames",
+        default="datasets/ms_coco_classnames.txt",
+        help="File with coco classes names"
+    )
+    parser.add_argument("--do_clip_tune", action='store_true', help="Whether to run clip tunning.")
+    parser.add_argument("--do_build_detectron_dataset", action='store_true', help="Whether to build dataset of features with detectron2.")
+    parser.add_argument(
+        "--data_subset",
+        type=float,
+        default=0,
+        help="Train on a a subset of train dataset. 0 is for regular train.",
+    )
+    parser.add_argument(
+        "--id_dictionary_file",
+        default="id_dictionary_file.txt",
+        help="File with dictionary of image ids and paths"
+    )
     args = parser.parse_args()
 
     global logger
@@ -940,6 +1171,16 @@ def main():
     logger.warning("Device: %s, n_gpu: %s", args.device, args.num_gpus)
     set_seed(args.seed, args.num_gpus)
     args = restore_training_settings(args)
+
+    if args.do_build_detectron_dataset:
+        oscar_dataset_builder.build_feature_dataset(args)
+
+    if args.do_clip_tune:
+        # Build dataset of features
+        oscar_dataset_builder.build_feature_dataset(args)
+        prf = args.input_path.split('/')[-1]
+        if not op.isfile(args.test_yaml):
+            args.test_yaml = os.path.join(args.working_dir, prf + '.yaml')
 
     # Load pretrained model and tokenizer
     config_class, model_class, tokenizer_class = BertConfig, BertForImageCaptioning, BertTokenizer
@@ -975,20 +1216,34 @@ def main():
     model.to(args.device)
     logger.info("Training/evaluation parameters %s", args)
     if args.do_train:
-        train_dataloader = make_data_loader(args, args.train_yaml, tokenizer,
-            args.distributed, is_train=True)
-        val_dataloader = None
-        if args.evaluate_during_training:
-            val_dataloader = make_data_loader(args, args.val_yaml, tokenizer,
-                args.distributed, is_train=False)
-        last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
+        if args.do_build_detectron_dataset:
+            train_dataloader = make_data_loader(args, args.train_yaml, tokenizer, args.distributed, is_train=True)
+            val_dataloader = None
+            if args.evaluate_during_training:
+                val_dataloader = make_data_loader(args, args.val_yaml, tokenizer,
+                                                  args.distributed, is_train=False)
+            last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
 
-        # test the last checkpoint after training
-        if args.do_test:
-            logger.info("Evaluate on dataset: " + args.test_yaml)
-            test_dataloader = make_data_loader(args, args.test_yaml, 
-                tokenizer, args.distributed, is_train=False)
-            evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
+        else:
+            train_dataloader = make_data_loader(args, args.train_yaml, tokenizer, args.distributed, is_train=True)
+            val_dataloader = None
+            if args.evaluate_during_training:
+                val_dataloader = make_data_loader(args, args.val_yaml, tokenizer,
+                    args.distributed, is_train=False)
+            last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
+
+            # test the last checkpoint after training
+            if args.do_test:
+                logger.info("Evaluate on dataset: " + args.test_yaml)
+                test_dataloader = make_data_loader(args, args.test_yaml,
+                    tokenizer, args.distributed, is_train=False)
+                evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
+
+    elif args.do_clip_tune:
+        logger.info("Evaluate on dataset: " + args.test_yaml)
+        test_dataloader = make_data_loader(args, args.test_yaml,
+                                           tokenizer, args.distributed, is_train=False)
+        clip_tune(args, test_dataloader, model, tokenizer, None) # TODO: Keeping last argument for saving the checkpoint
 
     # inference and evaluation
     elif args.do_test or args.do_eval:
