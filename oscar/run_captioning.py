@@ -1173,7 +1173,7 @@ def main():
     args = restore_training_settings(args)
 
     if args.do_build_detectron_dataset:
-        oscar_dataset_builder.build_feature_dataset(args)
+        feature_path = oscar_dataset_builder.build_feature_dataset(args)
 
     if args.do_clip_tune:
         # Build dataset of features
@@ -1215,40 +1215,54 @@ def main():
 
     model.to(args.device)
     logger.info("Training/evaluation parameters %s", args)
+
+    if os.path.isfile(args.train_yaml):
+        train_yaml = args.train_yaml
+    else:
+        train_yaml = os.path.join(feature_path, args.train_yaml)
+    if os.path.isfile(args.val_yaml):
+        val_yaml = args.val_yaml
+    else:
+        val_yaml = os.path.join(feature_path[:-len(feature_path.split('/')[-1])-1], args.val_yaml)
+    if os.path.isfile(args.test_yaml):
+        test_yaml = args.test_yaml
+    else:
+        test_yaml = os.path.join(feature_path[:-len(feature_path.split('/')[-1])-1], args.test_yaml)
+
     if args.do_train:
         if args.do_build_detectron_dataset:
-            train_dataloader = make_data_loader(args, args.train_yaml, tokenizer, args.distributed, is_train=True)
+            train_dataloader = make_data_loader(args, train_yaml, tokenizer, args.distributed, is_train=True)
             val_dataloader = None
             if args.evaluate_during_training:
-                val_dataloader = make_data_loader(args, args.val_yaml, tokenizer,
+                val_dataloader = make_data_loader(args, val_yaml, tokenizer,
                                                   args.distributed, is_train=False)
             last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
 
         else:
-            train_dataloader = make_data_loader(args, args.train_yaml, tokenizer, args.distributed, is_train=True)
+            train_dataloader = make_data_loader(args, train_yaml, tokenizer, args.distributed, is_train=True)
             val_dataloader = None
             if args.evaluate_during_training:
-                val_dataloader = make_data_loader(args, args.val_yaml, tokenizer,
+                val_dataloader = make_data_loader(args, val_yaml, tokenizer,
                     args.distributed, is_train=False)
             last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
 
             # test the last checkpoint after training
             if args.do_test:
-                logger.info("Evaluate on dataset: " + args.test_yaml)
-                test_dataloader = make_data_loader(args, args.test_yaml,
+                logger.info("Evaluate on dataset: " + test_yaml)
+                test_dataloader = make_data_loader(args, test_yaml,
                     tokenizer, args.distributed, is_train=False)
                 evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
 
     elif args.do_clip_tune:
-        logger.info("Evaluate on dataset: " + args.test_yaml)
-        test_dataloader = make_data_loader(args, args.test_yaml,
+        logger.info("Evaluate on dataset: " + test_yaml)
+        test_dataloader = make_data_loader(args, test_yaml,
                                            tokenizer, args.distributed, is_train=False)
         clip_tune(args, test_dataloader, model, tokenizer, None) # TODO: Keeping last argument for saving the checkpoint
 
     # inference and evaluation
     elif args.do_test or args.do_eval:
-        logger.info("Evaluate on dataset: " + args.test_yaml)
-        test_dataloader = make_data_loader(args, args.test_yaml,
+        logger.info("Evaluate on dataset: " + test_yaml)
+        test_dataloader = make_data_loader(args, test_yaml,
             tokenizer, args.distributed, is_train=False)
 
         if not args.do_eval:
