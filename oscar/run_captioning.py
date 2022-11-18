@@ -383,8 +383,8 @@ def make_data_loader(args, yaml_file, tokenizer, is_distributed=True,
     return data_loader
 
 
-def save_checkpoint(model, tokenizer, args, epoch, iteration, num_trial=10):
-    checkpoint_dir = op.join(args.output_dir, 'checkpoint-{}-{}'.format(
+def save_checkpoint(model, tokenizer, args, epoch, iteration, num_trial=10, feature_path=''):
+    checkpoint_dir = op.join(args.output_dir, feature_path, 'checkpoint-{}-{}'.format(
         epoch, iteration))
     if not is_main_process():
         return checkpoint_dir
@@ -504,7 +504,10 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
 
                 if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
                         global_step == t_total:
-                    checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step) 
+                    if args.do_build_detectron_dataset:
+                        checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step, feature_path=train_dataloader.dataset.root.split('/')[-1])
+                    else:
+                        checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step)
                     # evaluation
                     if args.evaluate_during_training: 
                         logger.info("Perform evaluation at step: %d" % (global_step))
@@ -617,6 +620,50 @@ def get_evaluate_method(predict_file):
         return 'coco'
 
 
+def evaluate_clip(args, predict_file):
+    if os.path.isfile(args.id_dictionary_file):
+        id_dictionary_file = args.id_dictionary_file
+    else:
+        id_dictionary_file = os.path.join(args.input_path, args.id_dictionary_file)
+        assert os.path.isfile(id_dictionary_file)
+    with open(id_dictionary_file, 'r') as f:
+        id_dictionary = json.load(f)
+
+    # CLIP init
+    clip_model, clip_preprocess = clip.load("ViT-B/32")
+    clip_model.cuda().eval()
+
+    img_src_path = os.path.join(args.input_path, predict_file.split('/')[-1].split('.')[2])
+
+    result = 0
+    n = 0
+    with open(predict_file, 'r') as f:
+        predict_file_content = f.readlines()
+    for line in predict_file_content:
+        img_id = line.split()[0]
+        predictions = json.loads(line.split('\t')[1])
+        img_path = os.path.join(img_src_path, id_dictionary[img_id])
+        assert os.path.exists(img_path)
+
+        image = Image.open(img_path).convert("RGB")
+        image_input = torch.tensor(np.stack([clip_preprocess(image)])).cuda()
+
+        for prediction in predictions:
+            text_tokens = clip.tokenize([prediction['caption']]).cuda()
+
+            # Compute cosine sim
+            with torch.no_grad():
+                image_features = clip_model.encode_image(image_input).float()
+                text_features = clip_model.encode_text(text_tokens).float()
+
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+            similarity = text_features.cpu().numpy() @ image_features.cpu().numpy().T
+            result += similarity
+            n += 1
+
+    return float(result / n)
+
 def evaluate(args, val_dataloader, model, tokenizer, output_dir):
     predict_file = get_predict_file(output_dir,
             val_dataloader.dataset.yaml_file, args)
@@ -630,6 +677,14 @@ def evaluate(args, val_dataloader, model, tokenizer, output_dir):
         data = val_dataloader.dataset.yaml_file.split('/')[-2]
         if 'nocaps' not in data:
             result = evaluate_on_coco_caption(predict_file, caption_file, outfile=evaluate_file)
+            if args.do_clip_eval:
+                print('computing CLIP score...')
+                clip_result = evaluate_clip(args, predict_file)
+                print("%s: %0.3f" % ('CLIP', clip_result))
+                result['CLIP'] = clip_result
+                with open(evaluate_file, 'w') as fp:
+                    json.dump(result, fp, indent=4)
+            #     TODO: rewrite evaluate file
             logger.info('evaluation result: {}'.format(str(result)))
             logger.info('evaluation result saved to {}'.format(evaluate_file))
     if get_world_size() > 1:
@@ -676,17 +731,25 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
     def gen_rows():
         time_meter = 0
 
-        # Dictionary of image file names
-        prf = args.input_path.split('/')[-1]
-        id_dict = {}
-        with open(os.path.join(args.working_dir, prf + '.id_dictionary.txt')) as f:
-            for line in f:
-                (key, val) = line.split()
-                id_dict[int(key)] = val
-
-        # CLIP init
-        clip_model, clip_preprocess = clip.load("ViT-B/32")
-        clip_model.cuda().eval()
+        # if os.path.isfile(args.id_dictionary_file):
+        #     id_dictionary_file = args.id_dictionary_file
+        # else:
+        #     id_dictionary_file = os.path.join(args.input_path, args.id_dictionary_file)
+        #     assert os.path.isfile(id_dictionary_file)
+        # with open(id_dictionary_file, 'r') as f:
+        #     id_dictionary = json.load(f)
+        #
+        # # Dictionary of image file names
+        # # prf = args.input_path.split('/')[-1]
+        # # id_dict = {}
+        # # with open(os.path.join(args.working_dir, prf + '.id_dictionary.txt')) as f:
+        # #     for line in f:
+        # #         (key, val) = line.split()
+        # #         id_dict[int(key)] = val
+        #
+        # # CLIP init
+        # clip_model, clip_preprocess = clip.load("ViT-B/32")
+        # clip_model.cuda().eval()
 
         with torch.no_grad():
             for step, (img_keys, batch) in tqdm(enumerate(test_dataloader)):
@@ -716,22 +779,23 @@ def test(args, test_dataloader, model, tokenizer, predict_file):
                         res.append({'caption': cap, 'conf': conf.item()})
                     if isinstance(img_key, torch.Tensor):
                         img_key = img_key.item()
-                    for item in res:
-                        print('Caption: {} \tConfidence {}'.format(item['caption'], item['conf']))
-                        img_path = os.path.join(args.input_path, id_dict[int(img_key)])
-                        image = Image.open(img_path).convert("RGB")
-                        image_input = torch.tensor(np.stack([clip_preprocess(image)])).cuda()
-                        text_tokens = clip.tokenize([item['caption']]).cuda()
-
-                        # Compute cosine sim
-                        with torch.no_grad():
-                            image_features = clip_model.encode_image(image_input).float()
-                            text_features = clip_model.encode_text(text_tokens).float()
-
-                        image_features /= image_features.norm(dim=-1, keepdim=True)
-                        text_features /= text_features.norm(dim=-1, keepdim=True)
-                        similarity = text_features.cpu().numpy() @ image_features.cpu().numpy().T
-                        print('Caption: {} \tCLIP similarity: {}'.format(item['caption'], similarity[0, 0]))
+                    # for item in res:
+                    #     print('Caption: {} \tConfidence {}'.format(item['caption'], item['conf']))
+                    #     img_path = os.path.join(args.input_path, test_dataloader.dataset.yaml_file.split('/')[-1].replace('.yaml', ''), id_dictionary[img_key])
+                    #     assert os.path.exists(img_path)
+                    #     image = Image.open(img_path).convert("RGB")
+                    #     image_input = torch.tensor(np.stack([clip_preprocess(image)])).cuda()
+                    #     text_tokens = clip.tokenize([item['caption']]).cuda()
+                    #
+                    #     # Compute cosine sim
+                    #     with torch.no_grad():
+                    #         image_features = clip_model.encode_image(image_input).float()
+                    #         text_features = clip_model.encode_text(text_tokens).float()
+                    #
+                    #     image_features /= image_features.norm(dim=-1, keepdim=True)
+                    #     text_features /= text_features.norm(dim=-1, keepdim=True)
+                    #     similarity = text_features.cpu().numpy() @ image_features.cpu().numpy().T
+                    #     print('Caption: {} \tCLIP similarity: {}'.format(item['caption'], similarity[0, 0]))
                     yield img_key, json.dumps(res)
 
         logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
@@ -1140,6 +1204,7 @@ def main():
         help="File with coco classes names"
     )
     parser.add_argument("--do_clip_tune", action='store_true', help="Whether to run clip tunning.")
+    parser.add_argument("--do_clip_eval", action='store_true', help="Whether to run clip evaluation.")
     parser.add_argument("--do_build_detectron_dataset", action='store_true', help="Whether to build dataset of features with detectron2.")
     parser.add_argument(
         "--data_subset",
@@ -1236,7 +1301,31 @@ def main():
             if args.evaluate_during_training:
                 val_dataloader = make_data_loader(args, val_yaml, tokenizer,
                                                   args.distributed, is_train=False)
+
+            t_start = time.time()
             last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
+            t_end = time.time()
+            t_elapsed = t_end-t_start
+
+            result_log = [last_checkpoint.split('/')[-2].split('_')[0], last_checkpoint.split('/')[-2].split('_')[1], t_elapsed]
+            if not os.path.isfile(os.path.join(args.output_dir, 'result_log.tsv')):
+                with open(os.path.join(args.output_dir, 'result_log.tsv'), 'w') as f:
+                    f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format('Split', 'Run', 'Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'METEOR', 'ROUGE_L', 'CIDEr', 'SPICE', 'CLIP'))
+
+            # test the last checkpoint after training
+            if args.do_test:
+                logger.info("Evaluate on dataset: " + test_yaml)
+                test_dataloader = make_data_loader(args, test_yaml,
+                    tokenizer, args.distributed, is_train=False)
+                evaluate_file = evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
+
+                with open(evaluate_file, 'r') as f:
+                    evaluation = json.load(f)
+                for metric in evaluation:
+                    result_log.append(evaluation[metric])
+
+            with open(os.path.join(args.output_dir, 'result_log.tsv'), 'w') as f:
+                f.write(''.join(str(item)+'\t' for item in result_log))
 
         else:
             train_dataloader = make_data_loader(args, train_yaml, tokenizer, args.distributed, is_train=True)
