@@ -1326,6 +1326,7 @@ def main():
 
             with open(os.path.join(args.output_dir, 'result_log.tsv'), 'a') as f:
                 f.write(''.join(str(item)+'\t' for item in result_log))
+                f.write('\n')
 
         else:
             train_dataloader = make_data_loader(args, train_yaml, tokenizer, args.distributed, is_train=True)
