@@ -1324,7 +1324,7 @@ def main():
                 for metric in evaluation:
                     result_log.append(evaluation[metric])
 
-            with open(os.path.join(args.output_dir, 'result_log.tsv'), 'w') as f:
+            with open(os.path.join(args.output_dir, 'result_log.tsv'), 'a') as f:
                 f.write(''.join(str(item)+'\t' for item in result_log))
 
         else:
