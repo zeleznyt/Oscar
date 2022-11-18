@@ -1310,7 +1310,7 @@ def main():
             result_log = [last_checkpoint.split('/')[-2].split('_')[0], last_checkpoint.split('/')[-2].split('_')[1], t_elapsed]
             if not os.path.isfile(os.path.join(args.output_dir, 'result_log.tsv')):
                 with open(os.path.join(args.output_dir, 'result_log.tsv'), 'w') as f:
-                    f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format('Split', 'Run', 'Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'METEOR', 'ROUGE_L', 'CIDEr', 'SPICE', 'CLIP'))
+                    f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format('Split', 'Run', 'Time[s]', 'Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'METEOR', 'ROUGE_L', 'CIDEr', 'SPICE', 'CLIP'))
 
             # test the last checkpoint after training
             if args.do_test:
