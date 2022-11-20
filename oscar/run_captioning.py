@@ -463,6 +463,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
     global_step, global_loss, global_acc =0,  0.0, 0.0
     model.zero_grad()
     eval_log = []
+    checkpoint_list = {'checkpoint_dir': [], 'score': []}
     best_score = 0
     for epoch in range(int(args.num_train_epochs)):
         for step, (img_keys, batch) in enumerate(train_dataloader):
@@ -544,7 +545,13 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
                 eval_log.append(res)
                 with open(args.output_dir + '/eval_logs.json', 'w') as f:
                     json.dump(eval_log, f)
-    return checkpoint_dir
+                checkpoint_list['checkpoint_dir'].append(checkpoint_dir)
+                checkpoint_list['score'].append(res['CIDEr'])
+    if len(checkpoint_list) > 0:
+        best_epoch, value = max(enumerate(checkpoint_list['score']))
+        return checkpoint_list['checkpoint_dir'][best_epoch]
+    else:
+        return checkpoint_dir
 
 
 def scst_train_iter(args, train_dataloader, model, scst_criterion, 
@@ -685,6 +692,7 @@ def evaluate_clip(args, predict_file):
             n += 1
 
     return float(result / n)
+
 
 def evaluate(args, val_dataloader, model, tokenizer, output_dir):
     predict_file = get_predict_file(output_dir,
