@@ -522,6 +522,28 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
                         eval_log.append(res)
                         with open(args.output_dir + '/eval_logs.json', 'w') as f:
                             json.dump(eval_log, f)
+
+        if args.save_after_nth_epoch > 0:
+            if args.do_build_detectron_dataset:
+                checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step,
+                                                 feature_path=
+                                                 train_dataloader.dataset.root.split('/')[-1])
+            else:
+                checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step)
+            # evaluation
+            if args.evaluate_during_training:
+                logger.info("Perform evaluation at step: %d" % (global_step))
+                evaluate_file = evaluate(args, val_dataset, model, tokenizer,
+                                         checkpoint_dir)
+                with open(evaluate_file, 'r') as f:
+                    res = json.load(f)
+                best_score = max(best_score, res['CIDEr'])
+                res['epoch'] = epoch
+                res['global_step'] = step
+                res['best_CIDEr'] = best_score
+                eval_log.append(res)
+                with open(args.output_dir + '/eval_logs.json', 'w') as f:
+                    json.dump(eval_log, f)
     return checkpoint_dir
 
 
@@ -1120,6 +1142,8 @@ def main():
     parser.add_argument('--logging_steps', type=int, default=20, help="Log every X steps.")
     parser.add_argument('--save_steps', type=int, default=-1, 
                         help="Save checkpoint every X steps. Will also perform evaluatin.")
+    parser.add_argument('--save_after_nth_epoch', type=int, default=-1,
+                        help="Save checkpoint every X epoch. Will also perform evaluatin.")
     parser.add_argument("--evaluate_during_training", action='store_true', 
                         help="Run evaluation during training at each save_steps.")
     parser.add_argument("--no_cuda", action='store_true', help="Avoid using CUDA.")
