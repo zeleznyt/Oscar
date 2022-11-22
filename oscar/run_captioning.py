@@ -524,7 +524,7 @@ def train(args, train_dataloader, val_dataset, model, tokenizer):
                         with open(args.output_dir + '/eval_logs.json', 'w') as f:
                             json.dump(eval_log, f)
 
-        if args.save_after_nth_epoch > 0:
+        if (args.save_after_nth_epoch > 0 and epoch % args.save_after_nth_epoch == 0) or epoch == int(args.num_train_epochs):
             if args.do_build_detectron_dataset:
                 checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step,
                                                  feature_path=
@@ -1339,10 +1339,10 @@ def main():
             t_end = time.time()
             t_elapsed = t_end-t_start
 
-            result_log = [last_checkpoint.split('/')[-2].split('_')[0], last_checkpoint.split('/')[-2].split('_')[1], t_elapsed]
+            result_log = [last_checkpoint.split('/')[-2].split('_')[0], last_checkpoint.split('/')[-2].split('_')[1], last_checkpoint.split('/')[-1].split('-')[0], t_elapsed]
             if not os.path.isfile(os.path.join(args.output_dir, 'result_log.tsv')):
                 with open(os.path.join(args.output_dir, 'result_log.tsv'), 'w') as f:
-                    f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format('Split', 'Run', 'Time[s]', 'Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'METEOR', 'ROUGE_L', 'CIDEr', 'SPICE', 'CLIP'))
+                    f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format('Split', 'Run', 'Epoch', 'Time[s]', 'Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'METEOR', 'ROUGE_L', 'CIDEr', 'SPICE', 'CLIP'))
 
             # test the last checkpoint after training
             if args.do_test:
