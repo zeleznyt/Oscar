@@ -33,4 +33,5 @@ if __name__ == '__main__':
                 results['checkpoint'].append(checkpoint.split('/')[-1])
         with open(os.path.join(directory, 'evaluation.json'), 'w') as f:
             json.dump(results, f)
+        print('Evaluation with length {} saved in {}', format(len(results), directory))
 
