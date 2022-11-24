@@ -11,9 +11,9 @@ if __name__ == '__main__':
     for directory in dir_list:
         results = {}
         for checkpoint in os.listdir(directory):
-            if not os.path.isdir(checkpoint):
-                continue
             checkpoint_dir = os.path.join(directory, checkpoint)
+            if not os.path.isdir(checkpoint_dir):
+                continue
             for file in os.listdir(checkpoint_dir):
                 if 'val' in file and 'eval.json' in file:
                     eval_file = os.path.join(checkpoint_dir, file)
