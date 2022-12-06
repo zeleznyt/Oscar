@@ -1366,14 +1366,32 @@ def main():
             if args.evaluate_during_training:
                 val_dataloader = make_data_loader(args, val_yaml, tokenizer,
                     args.distributed, is_train=False)
+
+            t_start = time.time()
             last_checkpoint = train(args, train_dataloader, val_dataloader, model, tokenizer)
+            t_end = time.time()
+            t_elapsed = t_end-t_start
+
+            result_log = [last_checkpoint.split('/')[-2].split('_')[0], last_checkpoint.split('/')[-2].split('_')[1], last_checkpoint.split('/')[-1].split('-')[1], t_elapsed]
+            if not os.path.isfile(os.path.join(args.output_dir, 'result_log.tsv')):
+                with open(os.path.join(args.output_dir, 'result_log.tsv'), 'w') as f:
+                    f.write('{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format('Split', 'Run', 'Epoch', 'Time[s]', 'Bleu_1', 'Bleu_2', 'Bleu_3', 'Bleu_4', 'METEOR', 'ROUGE_L', 'CIDEr', 'SPICE', 'CLIP'))
 
             # test the last checkpoint after training
             if args.do_test:
                 logger.info("Evaluate on dataset: " + test_yaml)
                 test_dataloader = make_data_loader(args, test_yaml,
                     tokenizer, args.distributed, is_train=False)
-                evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
+                evaluate_file = evaluate(args, test_dataloader, model, tokenizer, last_checkpoint)
+
+                with open(evaluate_file, 'r') as f:
+                    evaluation = json.load(f)
+                for metric in evaluation:
+                    result_log.append(evaluation[metric])
+
+            with open(os.path.join(args.output_dir, 'result_log.tsv'), 'a') as f:
+                f.write(''.join(str(item)+'\t' for item in result_log))
+                f.write('\n')
 
     elif args.do_clip_tune:
         logger.info("Evaluate on dataset: " + test_yaml)
